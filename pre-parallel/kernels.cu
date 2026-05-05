@@ -47,3 +47,49 @@ __global__ void matvec_softmax(const float* in, const float* W, const float* b,
 
     if (j < out_dim) out[j] = s[j];
 }
+
+__global__ void compute_delta3(const float* outa, const float* label,
+                               float* delta, int len) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= len) return;
+    delta[k] = label[k] - outa[k];
+}
+
+__global__ void compute_delta_hidden(const float* W_next, const float* delta_next,
+                                     const float* h_act, float* delta_out,
+                                     int dim, int next_dim) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= dim) return;
+    float err = 0.0f;
+    for (int k = 0; k < next_dim; k++) {
+        err += delta_next[k] * W_next[j * next_dim + k];
+    }
+    delta_out[j] = h_act[j] > 0.0f ? err : 0.0f;
+}
+
+__global__ void weight_update(float* W, const float* input, const float* delta,
+                              int in_dim, int out_dim, float lr) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= in_dim || j >= out_dim) return;
+    W[i * out_dim + j] += lr * input[i] * delta[j];
+}
+
+__global__ void bias_update(float* b, const float* delta, int dim, float lr) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= dim) return;
+    b[k] += lr * delta[k];
+}
+
+__global__ void accumulate_loss(const float* outa, const float* label,
+                                float* loss_accum, int len) {
+    extern __shared__ float s[];
+    int k = threadIdx.x;
+    s[k] = (k < len) ? -label[k] * logf(outa[k] + 1e-8f) : 0.0f;
+    __syncthreads();
+    if (k == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < len; i++) total += s[i];
+        atomicAdd(loss_accum, total);
+    }
+}
