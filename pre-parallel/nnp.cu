@@ -75,28 +75,49 @@ void train_model(MODEL* model){
     init_weights(model->W2, H1*H2); init_weights(model->b2, H2);
     init_weights(model->W3, H2*CLASSES); init_weights(model->b3, CLASSES);
 
+    float *d_W1, *d_b1, *d_W2, *d_b2, *d_W3, *d_b3;
+    float *d_train_data;
+    float *d_h1a, *d_h2a, *d_outa;
+
+    cudaMalloc(&d_W1, SIZE*H1*sizeof(float));
+    cudaMalloc(&d_b1, H1*sizeof(float));
+    cudaMalloc(&d_W2, H1*H2*sizeof(float));
+    cudaMalloc(&d_b2, H2*sizeof(float));
+    cudaMalloc(&d_W3, H2*CLASSES*sizeof(float));
+    cudaMalloc(&d_b3, CLASSES*sizeof(float));
+    cudaMalloc(&d_train_data, NUM_TRAIN*SIZE*sizeof(float));
+    cudaMalloc(&d_h1a, H1*sizeof(float));
+    cudaMalloc(&d_h2a, H2*sizeof(float));
+    cudaMalloc(&d_outa, CLASSES*sizeof(float));
+
+    cudaMemcpy(d_train_data, train_data, NUM_TRAIN*SIZE*sizeof(float), cudaMemcpyHostToDevice);
+
+    const int threads = 256;
+    const int blocks_h1 = (H1 + threads - 1) / threads;
+    const int blocks_h2 = (H2 + threads - 1) / threads;
+
     for (int epoch=0; epoch<EPOCHS; epoch++) {
         float loss=0;
         for (int n=0; n<NUM_TRAIN; n++) {
+            cudaMemcpy(d_W1, model->W1, SIZE*H1*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b1, model->b1, H1*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_W2, model->W2, H1*H2*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b2, model->b2, H2*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_W3, model->W3, H2*CLASSES*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_b3, model->b3, CLASSES*sizeof(float), cudaMemcpyHostToDevice);
+
             // ---------- Forward ----------
-            float h1[H1], h1a[H1];
-            for (int j=0;j<H1;j++){
-                h1[j]=model->b1[j];
-                for (int i=0;i<SIZE;i++) h1[j]+=train_data[n][i]*model->W1[i*H1+j];
-                h1a[j]=relu(h1[j]);
-            }
-            float h2[H2], h2a[H2];
-            for (int j=0;j<H2;j++){
-                h2[j]=model->b2[j];
-                for (int i=0;i<H1;i++) h2[j]+=h1a[i]*model->W2[i*H2+j];
-                h2a[j]=relu(h2[j]);
-            }
-            float out[CLASSES], outa[CLASSES];
-            for (int k=0;k<CLASSES;k++){
-                out[k]=model->b3[k];
-                for (int j=0;j<H2;j++) out[k]+=h2a[j]*model->W3[j*CLASSES+k];
-            }
-            softmax(out,outa,CLASSES);
+            matvec_relu<<<blocks_h1, threads>>>(
+                d_train_data + n*SIZE, d_W1, d_b1, d_h1a, SIZE, H1);
+            matvec_relu<<<blocks_h2, threads>>>(
+                d_h1a, d_W2, d_b2, d_h2a, H1, H2);
+            matvec_softmax<<<1, CLASSES, CLASSES*sizeof(float)>>>(
+                d_h2a, d_W3, d_b3, d_outa, H2, CLASSES);
+
+            float h1a[H1], h2a[H2], outa[CLASSES];
+            cudaMemcpy(h1a, d_h1a, H1*sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h2a, d_h2a, H2*sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(outa, d_outa, CLASSES*sizeof(float), cudaMemcpyDeviceToHost);
 
             // ---------- Loss ----------
             for (int k=0;k<CLASSES;k++)
@@ -139,6 +160,12 @@ void train_model(MODEL* model){
         }
         printf("Epoch %d, Loss=%.4f\n", epoch, loss/NUM_TRAIN);
     }
+
+    cudaFree(d_W1); cudaFree(d_b1);
+    cudaFree(d_W2); cudaFree(d_b2);
+    cudaFree(d_W3); cudaFree(d_b3);
+    cudaFree(d_train_data);
+    cudaFree(d_h1a); cudaFree(d_h2a); cudaFree(d_outa);
 }
 
 /* Save the trained model to a binary file

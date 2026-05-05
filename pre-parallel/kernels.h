@@ -1,10 +1,18 @@
-/* 
+/*
  * kernels.h
  *
  *  Created on: Nov 9, 2025
- *  
- *  Placeholder Header file for CUDA kernel functions
+ *
+ *  Header file for CUDA kernel functions
 */
 
-// Kernel function prototypes
-//__global__ void test_kernel();
+#ifndef KERNELS_H
+#define KERNELS_H
+
+__global__ void matvec_relu(const float* in, const float* W, const float* b,
+                            float* out, int in_dim, int out_dim);
+
+__global__ void matvec_softmax(const float* in, const float* W, const float* b,
+                               float* out, int in_dim, int out_dim);
+
+#endif
