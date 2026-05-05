@@ -2,90 +2,88 @@
  *
  *  Created on: Nov 9, 2025
  *
- *  CUDA kernels for the forward pass of the neural network.
+ *  Non-GEMM CUDA kernels (bias-broadcast, activations, ReLU mask,
+ *  bias-reduce, loss reduce). The three matmul-shaped operations live
+ *  in nnp.cu as cuBLAS sgemm calls.
+ *
+ *  Layout: activations row-major [batch, dim], indexed t[n*dim + j].
  */
 
 #include <cuda.h>
 #include <math.h>
 #include "kernels.h"
 
-__global__ void matvec_relu(const float* in, const float* W, const float* b,
-                            float* out, int in_dim, int out_dim) {
+// In-place bias-add + ReLU. Grid: (ceil(dim/threads), batch).
+__global__ void bias_relu_batched(float* x, const float* b, int dim, int batch) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= out_dim) return;
-    float sum = b[j];
-    for (int i = 0; i < in_dim; i++) {
-        sum += in[i] * W[i * out_dim + j];
-    }
-    out[j] = sum > 0.0f ? sum : 0.0f;
+    int n = blockIdx.y;
+    if (j >= dim || n >= batch) return;
+    int idx = n * dim + j;
+    float v = x[idx] + b[j];
+    x[idx] = v > 0.0f ? v : 0.0f;
 }
 
-__global__ void matvec_softmax(const float* in, const float* W, const float* b,
-                               float* out, int in_dim, int out_dim) {
+// In-place bias-add + per-row softmax. Grid: (batch). Block: dim threads.
+// Shared mem: dim floats. dim is small (CLASSES=10), so the per-row
+// max/exp/normalize reductions stay simple.
+__global__ void bias_softmax_batched(float* x, const float* b, int dim, int batch) {
     extern __shared__ float s[];
     int j = threadIdx.x;
-    if (j < out_dim) {
-        float sum = b[j];
-        for (int i = 0; i < in_dim; i++) {
-            sum += in[i] * W[i * out_dim + j];
-        }
-        s[j] = sum;
-    }
+    int n = blockIdx.x;
+    if (n >= batch) return;
+
+    if (j < dim) s[j] = x[n * dim + j] + b[j];
     __syncthreads();
 
     if (j == 0) {
         float max = s[0];
-        for (int k = 1; k < out_dim; k++) if (s[k] > max) max = s[k];
+        for (int k = 1; k < dim; k++) if (s[k] > max) max = s[k];
         float total = 0.0f;
-        for (int k = 0; k < out_dim; k++) {
+        for (int k = 0; k < dim; k++) {
             s[k] = expf(s[k] - max);
             total += s[k];
         }
-        for (int k = 0; k < out_dim; k++) s[k] /= total;
+        for (int k = 0; k < dim; k++) s[k] /= total;
     }
     __syncthreads();
 
-    if (j < out_dim) out[j] = s[j];
+    if (j < dim) x[n * dim + j] = s[j];
 }
 
-__global__ void compute_delta3(const float* outa, const float* label,
-                               float* delta, int len) {
+__global__ void compute_delta3_batched(const float* outa, const float* label,
+                                       float* delta, int len, int batch) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= len) return;
-    delta[k] = label[k] - outa[k];
+    int n = blockIdx.y;
+    if (k >= len || n >= batch) return;
+    int idx = n * len + k;
+    delta[idx] = label[idx] - outa[idx];
 }
 
-__global__ void compute_delta_hidden(const float* W_next, const float* delta_next,
-                                     const float* h_act, float* delta_out,
-                                     int dim, int next_dim) {
+__global__ void relu_mask_batched(float* delta, const float* h_act, int dim, int batch) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= dim) return;
-    float err = 0.0f;
-    for (int k = 0; k < next_dim; k++) {
-        err += delta_next[k] * W_next[j * next_dim + k];
-    }
-    delta_out[j] = h_act[j] > 0.0f ? err : 0.0f;
+    int n = blockIdx.y;
+    if (j >= dim || n >= batch) return;
+    int idx = n * dim + j;
+    if (h_act[idx] <= 0.0f) delta[idx] = 0.0f;
 }
 
-__global__ void weight_update(float* W, const float* input, const float* delta,
-                              int in_dim, int out_dim, float lr) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= in_dim || j >= out_dim) return;
-    W[i * out_dim + j] += lr * input[i] * delta[j];
-}
-
-__global__ void bias_update(float* b, const float* delta, int dim, float lr) {
+__global__ void bias_update_batched(float* b, const float* delta,
+                                    int dim, int batch, float lr_scaled) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= dim) return;
-    b[k] += lr * delta[k];
+    float acc = 0.0f;
+    for (int n = 0; n < batch; n++) acc += delta[n * dim + k];
+    b[k] += lr_scaled * acc;
 }
 
-__global__ void accumulate_loss(const float* outa, const float* label,
-                                float* loss_accum, int len) {
+__global__ void accumulate_loss_batched(const float* outa, const float* label,
+                                        float* loss_accum, int len, int batch) {
     extern __shared__ float s[];
     int k = threadIdx.x;
-    s[k] = (k < len) ? -label[k] * logf(outa[k] + 1e-8f) : 0.0f;
+    int n = blockIdx.x;
+    if (n >= batch) return;
+    int idx = n * len + k;
+    s[k] = (k < len) ? -label[idx] * logf(outa[idx] + 1e-8f) : 0.0f;
     __syncthreads();
     if (k == 0) {
         float total = 0.0f;

@@ -3,7 +3,7 @@ CC=nvcc
 CFLAGS=-std=c++17
 
 nnp:loader.o nnp.o main.o kernels.o
-	$(CC) $(CFLAGS) kernels.o nnp.o loader.o main.o -o nnp -lm
+	$(CC) $(CFLAGS) kernels.o nnp.o loader.o main.o -o nnp -lm -lcublas
 loader.o: loader.h config.h loader.cc
 	$(CC) -c loader.cc $(CFLAGS) -o loader.o
 

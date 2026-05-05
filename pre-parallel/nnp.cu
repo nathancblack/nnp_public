@@ -6,8 +6,8 @@
 
     Network architecture:
     - Input layer: 784 neurons (28x28 pixels)
-    - Hidden layer 1: 128 neurons, ReLU activation
-    - Hidden layer 2: 64 neurons, ReLU activation
+    - Hidden layer 1: H1 neurons (see config.h), ReLU activation
+    - Hidden layer 2: H2 neurons (see config.h), ReLU activation
     - Output layer: 10 neurons, Softmax activation
 
     Training:
@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <cuda.h>
+#include <cublas_v2.h>
 #include "config.h"
 #include "loader.h"
 #include "nnp.h"
@@ -90,15 +91,15 @@ void train_model(MODEL* model){
     cudaMalloc(&d_b3, CLASSES*sizeof(float));
     cudaMalloc(&d_train_data, NUM_TRAIN*SIZE*sizeof(float));
     cudaMalloc(&d_train_label, NUM_TRAIN*CLASSES*sizeof(float));
-    cudaMalloc(&d_h1a, H1*sizeof(float));
-    cudaMalloc(&d_h2a, H2*sizeof(float));
-    cudaMalloc(&d_outa, CLASSES*sizeof(float));
-    cudaMalloc(&d_delta1, H1*sizeof(float));
-    cudaMalloc(&d_delta2, H2*sizeof(float));
-    cudaMalloc(&d_delta3, CLASSES*sizeof(float));
+    cudaMalloc(&d_h1a, BATCH*H1*sizeof(float));
+    cudaMalloc(&d_h2a, BATCH*H2*sizeof(float));
+    cudaMalloc(&d_outa, BATCH*CLASSES*sizeof(float));
+    cudaMalloc(&d_delta1, BATCH*H1*sizeof(float));
+    cudaMalloc(&d_delta2, BATCH*H2*sizeof(float));
+    cudaMalloc(&d_delta3, BATCH*CLASSES*sizeof(float));
     cudaMalloc(&d_loss, sizeof(float));
-    cudaMalloc(&d_input, SIZE*sizeof(float));
-    cudaMalloc(&d_label, CLASSES*sizeof(float));
+    cudaMalloc(&d_input, BATCH*SIZE*sizeof(float));
+    cudaMalloc(&d_label, BATCH*CLASSES*sizeof(float));
 
     // One-time uploads — model lives on the GPU for the whole training run
     cudaMemcpy(d_train_data, train_data, NUM_TRAIN*SIZE*sizeof(float), cudaMemcpyHostToDevice);
@@ -115,45 +116,106 @@ void train_model(MODEL* model){
     const int blocks_h2 = (H2 + threads - 1) / threads;
     const int blocks_cls = (CLASSES + threads - 1) / threads;
 
-    dim3 block2d(16, 16);
-    dim3 grid_W3((CLASSES + 15)/16, (H2   + 15)/16);
-    dim3 grid_W2((H2      + 15)/16, (H1   + 15)/16);
-    dim3 grid_W1((H1      + 15)/16, (SIZE + 15)/16);
+    // Batched 1D launches: x = output-dim tiles, y = batch index.
+    dim3 grid_h1_b(blocks_h1, BATCH);
+    dim3 grid_h2_b(blocks_h2, BATCH);
+    dim3 grid_cls_b(blocks_cls, BATCH);
 
-    // Capture the per-sample kernel sequence into a CUDA graph. Inputs are
-    // routed through fixed d_input/d_label buffers so the graph's pointers
-    // stay valid across all 300k iterations.
+    // Per-batch LR scaling: W += (LR/B) * In^T @ delta. config.h is graded
+    // and may not change, so we fold 1/B in here instead of editing LR.
+    const float lr_scaled = LR / (float)BATCH;
+    static const float fone  = 1.0f;
+    static const float fzero = 0.0f;
+
+    const int num_batches = NUM_TRAIN / BATCH;          // drop trailing partial batch
+    const int samples_seen = num_batches * BATCH;       // for loss averaging
+
+    // cuBLAS handle bound to the captured stream. We pass row-major buffers
+    // to a column-major library; the standard trick is that a row-major
+    // matrix [r,c] is bit-identical to a column-major matrix [c,r], so the
+    // GEMM call is set up to compute the transpose of the desired result.
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
+    cublasHandle_t cublas;
+    cublasCreate(&cublas);
+    cublasSetStream(cublas, stream);
+    // Fixed workspace so cuBLAS doesn't try to lazily allocate during capture.
+    static float* cublas_workspace = nullptr;
+    const size_t cublas_ws_bytes = 4 * 1024 * 1024;
+    cudaMalloc(&cublas_workspace, cublas_ws_bytes);
+    cublasSetWorkspace(cublas, cublas_workspace, cublas_ws_bytes);
+
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
-    matvec_relu<<<blocks_h1, threads, 0, stream>>>(
-        d_input, d_W1, d_b1, d_h1a, SIZE, H1);
-    matvec_relu<<<blocks_h2, threads, 0, stream>>>(
-        d_h1a, d_W2, d_b2, d_h2a, H1, H2);
-    matvec_softmax<<<1, CLASSES, CLASSES*sizeof(float), stream>>>(
-        d_h2a, d_W3, d_b3, d_outa, H2, CLASSES);
+    // ---- forward ----
+    // d_h1a[B, H1] = d_input[B, SIZE] @ W1[SIZE, H1]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                H1, BATCH, SIZE,
+                &fone, d_W1, H1, d_input, SIZE,
+                &fzero, d_h1a, H1);
+    bias_relu_batched<<<grid_h1_b, threads, 0, stream>>>(d_h1a, d_b1, H1, BATCH);
 
-    accumulate_loss<<<1, CLASSES, CLASSES*sizeof(float), stream>>>(
-        d_outa, d_label, d_loss, CLASSES);
+    // d_h2a[B, H2] = d_h1a[B, H1] @ W2[H1, H2]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                H2, BATCH, H1,
+                &fone, d_W2, H2, d_h1a, H1,
+                &fzero, d_h2a, H2);
+    bias_relu_batched<<<grid_h2_b, threads, 0, stream>>>(d_h2a, d_b2, H2, BATCH);
 
-    compute_delta3<<<blocks_cls, threads, 0, stream>>>(
-        d_outa, d_label, d_delta3, CLASSES);
-    compute_delta_hidden<<<blocks_h2, threads, 0, stream>>>(
-        d_W3, d_delta3, d_h2a, d_delta2, H2, CLASSES);
-    compute_delta_hidden<<<blocks_h1, threads, 0, stream>>>(
-        d_W2, d_delta2, d_h1a, d_delta1, H1, H2);
+    // d_outa[B, CLASSES] = d_h2a[B, H2] @ W3[H2, CLASSES]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                CLASSES, BATCH, H2,
+                &fone, d_W3, CLASSES, d_h2a, H2,
+                &fzero, d_outa, CLASSES);
+    bias_softmax_batched<<<BATCH, CLASSES, CLASSES*sizeof(float), stream>>>(
+        d_outa, d_b3, CLASSES, BATCH);
 
-    weight_update<<<grid_W3, block2d, 0, stream>>>(d_W3, d_h2a, d_delta3, H2, CLASSES, LR);
-    bias_update<<<blocks_cls, threads, 0, stream>>>(d_b3, d_delta3, CLASSES, LR);
+    accumulate_loss_batched<<<BATCH, CLASSES, CLASSES*sizeof(float), stream>>>(
+        d_outa, d_label, d_loss, CLASSES, BATCH);
 
-    weight_update<<<grid_W2, block2d, 0, stream>>>(d_W2, d_h1a, d_delta2, H1, H2, LR);
-    bias_update<<<blocks_h2, threads, 0, stream>>>(d_b2, d_delta2, H2, LR);
+    // ---- backward ----
+    compute_delta3_batched<<<grid_cls_b, threads, 0, stream>>>(
+        d_outa, d_label, d_delta3, CLASSES, BATCH);
 
-    weight_update<<<grid_W1, block2d, 0, stream>>>(
-        d_W1, d_input, d_delta1, SIZE, H1, LR);
-    bias_update<<<blocks_h1, threads, 0, stream>>>(d_b1, d_delta1, H1, LR);
+    // d_delta2[B, H2] = d_delta3[B, CLASSES] @ W3^T[CLASSES, H2]
+    cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                H2, BATCH, CLASSES,
+                &fone, d_W3, CLASSES, d_delta3, CLASSES,
+                &fzero, d_delta2, H2);
+    relu_mask_batched<<<grid_h2_b, threads, 0, stream>>>(d_delta2, d_h2a, H2, BATCH);
+
+    // d_delta1[B, H1] = d_delta2[B, H2] @ W2^T[H2, H1]
+    cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                H1, BATCH, H2,
+                &fone, d_W2, H2, d_delta2, H2,
+                &fzero, d_delta1, H1);
+    relu_mask_batched<<<grid_h1_b, threads, 0, stream>>>(d_delta1, d_h1a, H1, BATCH);
+
+    // ---- weight + bias updates (alpha=lr_scaled, beta=1 fuses the apply) ----
+    // W3[H2, CLASSES] += lr_scaled * d_h2a^T[H2, B] @ d_delta3[B, CLASSES]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                CLASSES, H2, BATCH,
+                &lr_scaled, d_delta3, CLASSES, d_h2a, H2,
+                &fone, d_W3, CLASSES);
+    bias_update_batched<<<blocks_cls, threads, 0, stream>>>(
+        d_b3, d_delta3, CLASSES, BATCH, lr_scaled);
+
+    // W2[H1, H2] += lr_scaled * d_h1a^T[H1, B] @ d_delta2[B, H2]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                H2, H1, BATCH,
+                &lr_scaled, d_delta2, H2, d_h1a, H1,
+                &fone, d_W2, H2);
+    bias_update_batched<<<blocks_h2, threads, 0, stream>>>(
+        d_b2, d_delta2, H2, BATCH, lr_scaled);
+
+    // W1[SIZE, H1] += lr_scaled * d_input^T[SIZE, B] @ d_delta1[B, H1]
+    cublasSgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                H1, SIZE, BATCH,
+                &lr_scaled, d_delta1, H1, d_input, SIZE,
+                &fone, d_W1, H1);
+    bias_update_batched<<<blocks_h1, threads, 0, stream>>>(
+        d_b1, d_delta1, H1, BATCH, lr_scaled);
 
     cudaGraph_t graph;
     cudaStreamEndCapture(stream, &graph);
@@ -162,22 +224,24 @@ void train_model(MODEL* model){
 
     for (int epoch=0; epoch<EPOCHS; epoch++) {
         cudaMemsetAsync(d_loss, 0, sizeof(float), stream);
-        for (int n=0; n<NUM_TRAIN; n++) {
-            cudaMemcpyAsync(d_input, d_train_data + n*SIZE,
-                            SIZE*sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(d_label, d_train_label + n*CLASSES,
-                            CLASSES*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        for (int batch_start=0; batch_start<samples_seen; batch_start+=BATCH) {
+            cudaMemcpyAsync(d_input, d_train_data + batch_start*SIZE,
+                            BATCH*SIZE*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(d_label, d_train_label + batch_start*CLASSES,
+                            BATCH*CLASSES*sizeof(float), cudaMemcpyDeviceToDevice, stream);
             cudaGraphLaunch(graph_exec, stream);
         }
         float loss;
         cudaMemcpyAsync(&loss, d_loss, sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
-        printf("Epoch %d, Loss=%.4f\n", epoch, loss/NUM_TRAIN);
+        printf("Epoch %d, Loss=%.4f\n", epoch, loss/samples_seen);
     }
 
     cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
+    cublasDestroy(cublas);
+    cudaFree(cublas_workspace);
     cudaStreamDestroy(stream);
 
     // Pull trained model back to host so save_model can write it to disk
