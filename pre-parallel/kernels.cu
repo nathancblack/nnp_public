@@ -1,5 +1,7 @@
 /* kernels.cu
  *
+ *  Worked in a pair: Nathaniel Black and Marcos Diaz Vazquez
+ *
  *  Created on: Nov 9, 2025
  *
  *  Non-GEMM CUDA kernels (bias-broadcast, activations, ReLU mask,

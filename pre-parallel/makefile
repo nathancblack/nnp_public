@@ -1,3 +1,4 @@
+# Worked in a pair: Nathaniel Black and Marcos Diaz Vazquez
 CC=nvcc
 #CFLAGS=-g
 # Default build: B=64 (full convergence quality, grading-friendly), TF32 on,

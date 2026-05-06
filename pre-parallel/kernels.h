@@ -1,6 +1,8 @@
 /*
  * kernels.h
  *
+ *  Worked in a pair: Nathaniel Black and Marcos Diaz Vazquez
+ *
  *  Created on: Nov 9, 2025
  *
  *  Header file for CUDA kernel functions.

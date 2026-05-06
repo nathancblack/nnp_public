@@ -1,6 +1,8 @@
 /*
     nnp.cu
 
+    Worked in a pair: Nathaniel Black and Marcos Diaz Vazquez
+
     Created on: Nov 9, 2025
     Serial implementation of a simple feedforward neural network for MNIST digit classification.
 
